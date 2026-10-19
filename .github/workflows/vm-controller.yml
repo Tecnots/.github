@@ -1,0 +1,106 @@
+name: Tecnots CI — VM Controller (JIT Runner)
+
+# Spawns/cleans up ephemeral GitHub Actions runners registered to the calling repo.
+# Called by workflows in other repos (e.g. 360Solve/360Solve-ERP) via:
+#
+#   uses: Tecnots/.github/.github/workflows/vm-controller.yml@main
+#   with:
+#     action: start    # or stop
+#     runner: linux
+#   secrets: inherit
+#
+# For `action: start`:
+#   - Runs on a Tecnots self-hosted runner (has Docker)
+#   - Uses RUNNER_ADMIN_TOKEN to create a JIT runner config for the calling repo
+#   - Starts an ephemeral GitHub Actions runner in Docker, registered to caller repo
+#   - Outputs the unique runner label so the caller can target it
+#
+# For `action: stop`:
+#   - JIT runners auto-deregister after completing one job; nothing to do.
+
+on:
+  workflow_call:
+    inputs:
+      action:
+        description: "start or stop"
+        required: true
+        type: string
+      runner:
+        description: "Runner type: linux"
+        required: false
+        type: string
+        default: linux
+    outputs:
+      runner-label:
+        description: "Unique label of the spawned ephemeral runner"
+        value: ${{ jobs.controller.outputs.runner-label }}
+
+jobs:
+  controller:
+    name: "${{ inputs.action }} runner"
+    runs-on: [self-hosted, linux, azure, eastasia]
+    outputs:
+      runner-label: ${{ steps.start.outputs.runner-label }}
+    steps:
+      # ── START: spawn ephemeral Docker runner for the calling repo ────────────
+      - name: Spawn JIT runner for ${{ github.repository }}
+        id: start
+        if: inputs.action == 'start'
+        env:
+          RUNNER_ADMIN_TOKEN: ${{ secrets.RUNNER_ADMIN_TOKEN }}
+          CALLER_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          LABEL="jit-$(date +%s)-${RANDOM}"
+          echo "Spawning JIT runner '${LABEL}' for ${CALLER_REPO}..."
+
+          # Create a JIT runner config (single-use, auto-removes after one job)
+          JIT_RESPONSE=$(curl -sf -X POST \
+            -H "Authorization: token ${RUNNER_ADMIN_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${CALLER_REPO}/actions/runners/generate-jit-config" \
+            -d "{\"name\":\"${LABEL}\",\"runner_group_id\":1,\"labels\":[\"self-hosted\",\"linux\",\"azure\",\"eastasia\",\"${LABEL}\"],\"work_folder\":\"_work\"}")
+
+          JIT_CONFIG=$(echo "$JIT_RESPONSE" | jq -r .encoded_jit_config)
+
+          if [ -z "$JIT_CONFIG" ] || [ "$JIT_CONFIG" = "null" ]; then
+            echo "::error::Failed to generate JIT config. Response: $JIT_RESPONSE"
+            exit 1
+          fi
+
+          echo "JIT config obtained. Starting Docker runner..."
+
+          # Pull the runner image if not cached
+          docker pull ghcr.io/actions/actions-runner:latest 2>/dev/null \
+            || docker pull myoung34/github-runner:latest
+
+          # Start ephemeral runner (auto-removes when job finishes)
+          docker run -d --rm \
+            --name "${LABEL}" \
+            -e GITHUB_ACTIONS=true \
+            ghcr.io/actions/actions-runner:latest \
+            ./run.sh --jitconfig "${JIT_CONFIG}" \
+            || docker run -d --rm \
+              --name "${LABEL}" \
+              -e RUNNER_TOKEN="" \
+              -e RUNNER_NAME="${LABEL}" \
+              -e RUNNER_WORKDIR="/tmp/${LABEL}" \
+              -e RUNNER_LABELS="self-hosted,linux,azure,eastasia,${LABEL}" \
+              -e RUNNER_EPHEMERAL=true \
+              -e RUNNER_JIT_CONFIG="${JIT_CONFIG}" \
+              myoung34/github-runner:latest
+
+          echo "runner-label=${LABEL}" >> "$GITHUB_OUTPUT"
+          echo "✅ Ephemeral runner '${LABEL}' started for ${CALLER_REPO}"
+
+      # ── STOP: JIT runners auto-deregister; clean up any leftover containers ──
+      - name: Cleanup (JIT runners auto-deregister)
+        if: inputs.action == 'stop'
+        run: |
+          echo "JIT runners deregister automatically after completing one job."
+          # Remove any leftover containers from this workflow run (best-effort)
+          docker ps --filter "name=jit-" --format "{{.Names}}" \
+            | xargs -r docker rm -f 2>/dev/null || true
+          echo "✅ Cleanup complete"
