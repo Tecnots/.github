@@ -1,9 +1,14 @@
 name: Tecnots CI — API Build & Deploy
 
-# Called from 360Solve/360Solve-ERP via `uses: Tecnots/.github/.github/workflows/deploy-api.yml@main`
-# Runs entirely on Tecnots self-hosted runners.
-# OIDC token sub-claim reflects the CALLING workflow's repository (360Solve/360Solve-ERP),
-# so Azure federated-credential authentication works correctly.
+# Called from 360Solve/360Solve-ERP via:
+#   uses: Tecnots/.github/.github/workflows/deploy-api.yml@main
+#
+# Runs entirely on Tecnots self-hosted azure-linux-eastasia runners.
+# Target resolution (app-name, resource-group, image tags) is handled here
+# so the caller needs to pass only `ref` and `environment`.
+#
+# OIDC token sub-claim reflects the CALLING workflow's repository
+# (360Solve/360Solve-ERP), so Azure federated-credential auth works correctly.
 
 on:
   workflow_call:
@@ -16,22 +21,6 @@ on:
         description: "Target environment (staging | production)"
         required: true
         type: string
-      app-name:
-        description: "Azure App Service name"
-        required: true
-        type: string
-      resource-group:
-        description: "Azure resource group"
-        required: true
-        type: string
-      full-image:
-        description: "Full image tag (acr/image:sha)"
-        required: true
-        type: string
-      env-latest-tag:
-        description: "Environment latest tag (acr/image:env-latest)"
-        required: true
-        type: string
     secrets:
       CALLER_TOKEN:
         description: "GITHUB_TOKEN from the calling workflow (for checkout of 360Solve/360Solve-ERP)"
@@ -41,12 +30,36 @@ jobs:
   build:
     name: "Build & Push"
     runs-on: [self-hosted, linux, azure, eastasia]
+    outputs:
+      full-image: ${{ steps.vars.outputs.full-image }}
+      env-latest-tag: ${{ steps.vars.outputs.env-latest-tag }}
+      app-name: ${{ steps.vars.outputs.app-name }}
+      resource-group: ${{ steps.vars.outputs.resource-group }}
     steps:
       - uses: actions/checkout@v4
         with:
           repository: 360Solve/360Solve-ERP
           ref: ${{ inputs.ref }}
           token: ${{ secrets.CALLER_TOKEN }}
+
+      - id: vars
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          ACR="crtecnots.azurecr.io"
+          IMAGE_NAME="360solve-api"
+          ENV="${{ inputs.environment }}"
+          if [ "$ENV" = "production" ]; then
+            APP_NAME="360solve-api"
+            RG="rg-360solve-prod"
+          else
+            APP_NAME="360solve-api-staging"
+            RG="rg-360solve-staging"
+          fi
+          echo "full-image=${ACR}/${IMAGE_NAME}:${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "env-latest-tag=${ACR}/${IMAGE_NAME}:${ENV}-latest" >> "$GITHUB_OUTPUT"
+          echo "app-name=${APP_NAME}" >> "$GITHUB_OUTPUT"
+          echo "resource-group=${RG}" >> "$GITHUB_OUTPUT"
+          echo "image-tag=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
 
       - name: Azure Login (OIDC — 360Solve context)
         uses: azure/login@v2
@@ -65,8 +78,8 @@ jobs:
           file: ./src/_360Solve.Api/Dockerfile.prod
           push: true
           tags: |
-            ${{ inputs.full-image }}
-            ${{ inputs.env-latest-tag }}
+            ${{ steps.vars.outputs.full-image }}
+            ${{ steps.vars.outputs.env-latest-tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -92,8 +105,8 @@ jobs:
           if [ -n "$ERP_CONN" ] && [ -n "$CON_CONN" ]; then
             echo "Syncing connection strings from Key Vault ($KV)..."
             az webapp config appsettings set \
-              --name "${{ inputs.app-name }}" \
-              --resource-group "${{ inputs.resource-group }}" \
+              --name "${{ needs.build.outputs.app-name }}" \
+              --resource-group "${{ needs.build.outputs.resource-group }}" \
               --settings "_360Solve__Data__ConnectionString=$ERP_CONN" "Console__ConnectionString=$CON_CONN" \
               -o none
             echo "✅ Connection strings synced"
@@ -104,15 +117,15 @@ jobs:
       - name: Deploy to App Service
         uses: azure/webapps-deploy@v3
         with:
-          app-name: ${{ inputs.app-name }}
-          images: ${{ inputs.full-image }}
+          app-name: ${{ needs.build.outputs.app-name }}
+          images: ${{ needs.build.outputs.full-image }}
 
       - name: Wait for healthy
         run: |
-          HOST=$(az webapp show --name "${{ inputs.app-name }}" \
-            --resource-group "${{ inputs.resource-group }}" \
+          HOST=$(az webapp show --name "${{ needs.build.outputs.app-name }}" \
+            --resource-group "${{ needs.build.outputs.resource-group }}" \
             --query defaultHostName -o tsv 2>/dev/null \
-            || echo "${{ inputs.app-name }}.azurewebsites.net")
+            || echo "${{ needs.build.outputs.app-name }}.azurewebsites.net")
           HEALTH_URL="https://${HOST}/health"
           echo "Health endpoint: ${HEALTH_URL}"
           HEALTHY=false
@@ -137,7 +150,7 @@ jobs:
             echo "### ✅ API ${{ inputs.environment }} deployed"
             echo "| | |"
             echo "|---|---|"
-            echo "| **Image** | \`${{ inputs.full-image }}\` |"
-            echo "| **App** | \`${{ inputs.app-name }}\` (\`${{ inputs.resource-group }}\`) |"
+            echo "| **Image** | \`${{ needs.build.outputs.full-image }}\` |"
+            echo "| **App** | \`${{ needs.build.outputs.app-name }}\` (\`${{ needs.build.outputs.resource-group }}\`) |"
             echo "| **Ref** | \`${{ inputs.ref }}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
