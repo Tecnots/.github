@@ -1,0 +1,81 @@
+name: Tecnots CI — Register 360Solve Runner
+
+# One-time bootstrap: starts a persistent GitHub Actions runner on a Tecnots VM,
+# registered to 360Solve/360Solve-ERP repo. Run this once manually to provision runners.
+# The runners auto-reconnect on Docker restart (--restart unless-stopped).
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_count:
+        description: "Number of runners to register (1-3)"
+        required: false
+        type: choice
+        options: ["1", "2", "3"]
+        default: "2"
+
+jobs:
+  register:
+    name: Register persistent runners to 360Solve/360Solve-ERP
+    runs-on: [self-hosted, linux, azure, eastasia]
+    env:
+      RUNNER_ADMIN_TOKEN: ${{ secrets.RUNNER_ADMIN_TOKEN }}
+      TARGET_REPO: 360Solve/360Solve-ERP
+    steps:
+      - name: Stop any existing 360Solve runner containers
+        run: |
+          docker ps --filter "name=360solve-erp-runner-" --format "{{.Names}}" \
+            | xargs -r docker stop 2>/dev/null || true
+          docker ps -a --filter "name=360solve-erp-runner-" --format "{{.Names}}" \
+            | xargs -r docker rm -f 2>/dev/null || true
+          echo "Cleaned up existing runners"
+
+      - name: Register ${{ inputs.runner_count }} runner(s)
+        run: |
+          set -euo pipefail
+          COUNT="${{ inputs.runner_count }}"
+          LABELS="self-hosted,linux,azure,eastasia"
+
+          for i in $(seq 1 "$COUNT"); do
+            RUNNER_NAME="360solve-erp-runner-${i}"
+            echo "Registering ${RUNNER_NAME}..."
+
+            # Get a registration token for the target repo
+            REG_TOKEN=$(curl -sf -X POST \
+              -H "Authorization: token ${RUNNER_ADMIN_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${TARGET_REPO}/actions/runners/registration-token" \
+              | jq -r .token)
+
+            if [ -z "$REG_TOKEN" ] || [ "$REG_TOKEN" = "null" ]; then
+              echo "::error::Failed to get registration token for runner ${i}"
+              exit 1
+            fi
+
+            # Start a persistent runner container (restarts automatically)
+            docker run -d \
+              --name "${RUNNER_NAME}" \
+              --restart unless-stopped \
+              -e RUNNER_SCOPE=repo \
+              -e REPO_URL="https://github.com/${TARGET_REPO}" \
+              -e RUNNER_TOKEN="${REG_TOKEN}" \
+              -e RUNNER_NAME="${RUNNER_NAME}" \
+              -e LABELS="${LABELS}" \
+              -e RUNNER_WORKDIR="/tmp/_work/${RUNNER_NAME}" \
+              myoung34/github-runner:latest
+
+            echo "✅ Runner ${RUNNER_NAME} started"
+          done
+
+      - name: Verify runners registered
+        run: |
+          echo "Waiting 20s for runners to connect..."
+          sleep 20
+          echo "Registered runners for ${TARGET_REPO}:"
+          curl -sf \
+            -H "Authorization: token ${RUNNER_ADMIN_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${TARGET_REPO}/actions/runners" \
+            | jq '.runners[] | {id, name, status, labels: [.labels[].name]}'
