@@ -1,0 +1,143 @@
+name: Tecnots CI — API Build & Deploy
+
+# Called from 360Solve/360Solve-ERP via `uses: Tecnots/.github/.github/workflows/deploy-api.yml@main`
+# Runs entirely on Tecnots self-hosted runners.
+# OIDC token sub-claim reflects the CALLING workflow's repository (360Solve/360Solve-ERP),
+# so Azure federated-credential authentication works correctly.
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: "Branch or tag to build (e.g. v2.23.0, main)"
+        required: true
+        type: string
+      environment:
+        description: "Target environment (staging | production)"
+        required: true
+        type: string
+      app-name:
+        description: "Azure App Service name"
+        required: true
+        type: string
+      resource-group:
+        description: "Azure resource group"
+        required: true
+        type: string
+      full-image:
+        description: "Full image tag (acr/image:sha)"
+        required: true
+        type: string
+      env-latest-tag:
+        description: "Environment latest tag (acr/image:env-latest)"
+        required: true
+        type: string
+    secrets:
+      CALLER_TOKEN:
+        description: "GITHUB_TOKEN from the calling workflow (for checkout of 360Solve/360Solve-ERP)"
+        required: true
+
+jobs:
+  build:
+    name: "Build & Push"
+    runs-on: [self-hosted, linux, azure, eastasia]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: 360Solve/360Solve-ERP
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.CALLER_TOKEN }}
+
+      - name: Azure Login (OIDC — 360Solve context)
+        uses: azure/login@v2
+        with:
+          client-id: 75008beb-3f15-4d80-b9e5-f771fbd5102f
+          tenant-id: 637707ac-8960-4aa5-9c3d-c8accf2515ad
+          subscription-id: 39025f73-06c7-4867-be58-e36f1f9a4347
+
+      - run: az acr login --name crtecnots
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: ./src
+          file: ./src/_360Solve.Api/Dockerfile.prod
+          push: true
+          tags: |
+            ${{ inputs.full-image }}
+            ${{ inputs.env-latest-tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: "Deploy → ${{ inputs.environment }}"
+    needs: [build]
+    runs-on: [self-hosted, linux, azure, eastasia]
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Azure Login (OIDC — 360Solve context)
+        uses: azure/login@v2
+        with:
+          client-id: 75008beb-3f15-4d80-b9e5-f771fbd5102f
+          tenant-id: 637707ac-8960-4aa5-9c3d-c8accf2515ad
+          subscription-id: 39025f73-06c7-4867-be58-e36f1f9a4347
+
+      - name: Sync PostgreSQL connection strings from Key Vault
+        run: |
+          ENV="${{ inputs.environment }}"
+          KV="$([ "$ENV" = "production" ] && echo kv-360solve-prod || echo kv-360solve-stg)"
+          ERP_CONN=$(az keyvault secret show --vault-name "$KV" --name postgres-erp-connection-string --query value -o tsv 2>/dev/null || echo "")
+          CON_CONN=$(az keyvault secret show --vault-name "$KV" --name postgres-console-connection-string --query value -o tsv 2>/dev/null || echo "")
+          if [ -n "$ERP_CONN" ] && [ -n "$CON_CONN" ]; then
+            echo "Syncing connection strings from Key Vault ($KV)..."
+            az webapp config appsettings set \
+              --name "${{ inputs.app-name }}" \
+              --resource-group "${{ inputs.resource-group }}" \
+              --settings "_360Solve__Data__ConnectionString=$ERP_CONN" "Console__ConnectionString=$CON_CONN" \
+              -o none
+            echo "✅ Connection strings synced"
+          else
+            echo "⚠️ Key Vault secrets not found — using existing App Service settings"
+          fi
+
+      - name: Deploy to App Service
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ inputs.app-name }}
+          images: ${{ inputs.full-image }}
+
+      - name: Wait for healthy
+        run: |
+          HOST=$(az webapp show --name "${{ inputs.app-name }}" \
+            --resource-group "${{ inputs.resource-group }}" \
+            --query defaultHostName -o tsv 2>/dev/null \
+            || echo "${{ inputs.app-name }}.azurewebsites.net")
+          HEALTH_URL="https://${HOST}/health"
+          echo "Health endpoint: ${HEALTH_URL}"
+          HEALTHY=false
+          for i in $(seq 1 24); do
+            RESP=$(curl -s --max-time 15 "$HEALTH_URL" 2>/dev/null || echo '{}')
+            STATUS=$(echo "$RESP" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('status','Unknown'))" 2>/dev/null || echo "Unreachable")
+            DB=$(echo "$RESP" | python3 -c "import json,sys; d=json.load(sys.stdin); cs=[c for c in d.get('checks',[]) if c['name']=='database']; print(cs[0]['status'] if cs else 'N/A')" 2>/dev/null || echo "N/A")
+            echo "  [$i/24] API=${STATUS}  DB=${DB}"
+            if [ "$STATUS" = "Healthy" ]; then
+              HEALTHY=true
+              echo "✅ API healthy, PostgreSQL connected"
+              break
+            fi
+            sleep 10
+          done
+          [ "$HEALTHY" = "true" ] || { echo "::error::Health gate failed after 4 min"; exit 1; }
+
+      - name: Deploy summary
+        if: success()
+        run: |
+          {
+            echo "### ✅ API ${{ inputs.environment }} deployed"
+            echo "| | |"
+            echo "|---|---|"
+            echo "| **Image** | \`${{ inputs.full-image }}\` |"
+            echo "| **App** | \`${{ inputs.app-name }}\` (\`${{ inputs.resource-group }}\`) |"
+            echo "| **Ref** | \`${{ inputs.ref }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
