@@ -1,0 +1,40 @@
+name: Runner VM — Keep Alive
+
+# Runs every 30 min. Starts the VM if it is deallocated.
+# This is the only mechanism that starts tecnots-linux-runner-01;
+# no workflow should ever deallocate it.
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:    # allow manual trigger
+
+jobs:
+  keepalive:
+    name: Ensure runner VM is running
+    runs-on: ubuntu-latest
+    steps:
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Start VM if deallocated
+        run: |
+          STATE=$(az vm get-instance-view \
+            --resource-group ${{ secrets.RUNNER_LINUX_RG }} \
+            --name ${{ secrets.RUNNER_LINUX_VM }} \
+            --query "instanceView.statuses[?starts_with(code,'PowerState/')].displayStatus" \
+            -o tsv 2>/dev/null | tail -1)
+
+          echo "Current VM state: $STATE"
+
+          if [ "$STATE" = "VM deallocated" ] || [ "$STATE" = "VM stopped" ]; then
+            echo "VM is not running — starting now..."
+            az vm start \
+              --resource-group ${{ secrets.RUNNER_LINUX_RG }} \
+              --name ${{ secrets.RUNNER_LINUX_VM }}
+            echo "✅ VM started"
+          else
+            echo "✅ VM already running ($STATE) — nothing to do"
+          fi
